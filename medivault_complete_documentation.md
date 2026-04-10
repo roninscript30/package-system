@@ -2910,6 +2910,135 @@ Steps:
 
 ---
 
+## 17. DEVELOPER SETUP & LOCAL ENVIRONMENT
+
+### 17.1 Prerequisites
+- Node.js (v18+)
+- Python 3.10+
+- Docker & Docker Compose
+- AWS CLI (configured for production testing, optional for local mock)
+
+### 17.2 Local Infrastructure
+MediVault provides a `docker-compose.yml` to easily spin up local dependencies:
+```bash
+# Start local MongoDB instance (runs on port 27017)
+docker-compose up -d
+```
+
+### 17.3 Backend Setup (FastAPI)
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+# Database initialization & utilities
+python seed_user.py
+python set_cors.py
+
+# Start the local server
+uvicorn app.main:app --reload --port 8000
+```
+
+### 17.4 Frontend Setup (React/Vite)
+```bash
+cd frontend
+npm install
+npm run dev  # Starts Vite dev server on port 5173
+```
+
+---
+
+## 18. CLIENT-SIDE FILE RENDERING & PREVIEWS
+
+### 18.1 Local File Preview Features
+Before triggering large uploads, MediVault provides instantaneous local file previews without server roundtrips, relying on browser-native APIs (`URL.createObjectURL`).
+
+#### Viewer Components (`src/components/viewers/`)
+- **`DicomViewer.jsx`**: Renders `.dcm` medical scans using WebGL libraries (e.g., Cornerstone.js or cornerstone-core).
+- **`PdfViewer.jsx`**: Renders PDF lab results using PDF.js.
+- **`ExcelViewer.jsx`**: Renders tabular healthcare data (.xlsx/.csv).
+- **`ImageViewer.jsx`**: Handles standard `.png`, `.jpg`, and `.tiff` formats.
+
+### 18.2 Memory Management for Large Previews
+To avoid out-of-memory browser crashes with 1GB+ files:
+- Previews read only necessary file headers/thumbnails (e.g., DICOM metadata parsing).
+- Object URLs are aggressively garbage-collected (`URL.revokeObjectURL()`) when the viewer unmounts.
+
+---
+
+## 19. API DOCUMENTATION & INTEGRATION
+
+### 19.1 Interactive OpenAPI Specs
+Because the backend is built with FastAPI, MediVault automatically generates interactive OpenAPI/Swagger documentation based on Pydantic schemas.
+
+- **Swagger UI:** Accessible at `http://localhost:8000/docs` - Use this for interactive in-browser testing.
+- **ReDoc:** Accessible at `http://localhost:8000/redoc` - Use this for comprehensive read-only documentation.
+
+### 19.2 Client Generation
+Frontend developers can automatically generate Axios/Fetch clients by exporting the `openapi.json` from the backend, ensuring type safety between the Python models and React components.
+
+---
+
+## 20. ERROR CODE DICTIONARY
+
+| Error Code | HTTP Status | Description | User-Facing Message | Resolution |
+|---|---|---|---|---|
+| `ERR_AUTH_EXPIRED` | 401 | JWT token expired during session | "Your session has expired. Please log in again." | Redirect to login, preserve upload state in localStorage. |
+| `ERR_QUOTA_REACHED` | 403 | User exceeded monthly GB limit | "Upload quota exceeded. Contact administrator." | Upgrade user tier or clean up old files. |
+| `ERR_S3_TIMEOUT` | 504 | Network drop during chunk PUT | "Network interrupted. Retrying chunk..." | AI auto-adjusts backoff and retries. |
+| `ERR_DICOM_INVALID` | 422 | Failed AI format validation | "File appears corrupted or invalid DICOM." | Reject file, ask user to re-export from PACS. |
+| `ERR_HASH_MISMATCH` | 409 | Uploaded chunks don't match original | "File corrupted during transit." | Re-upload mismatched chunks. |
+
+---
+
+## 21. DISASTER RECOVERY & BUSINESS CONTINUITY
+
+### 21.1 RTO & RPO Metrics
+- **Recovery Time Objective (RTO):** 4 Hours (time to restore system availability).
+- **Recovery Point Objective (RPO):** 15 Minutes (maximum acceptable data loss window).
+
+### 21.2 S3 Data Protection
+- **Cross-Region Replication (CRR):** All `medical-files` S3 buckets replicate sequentially to a standby region (e.g., `us-east-1` to `us-west-2`).
+- **Soft Deletes:** S3 Versioning is enabled. Accidental deletions create delete markers rather than destroying the object.
+
+### 21.3 Database Backups
+- MongoDB Atlas takes continuous incremental snapshots.
+- Point-in-time recovery enables restoring the metadata DB to any minute within the last 30 days.
+
+---
+
+## 22. CONTRIBUTING TO MEDIVAULT
+
+### 22.1 Branching Strategy
+MediVault follows a strict Git Flow model to ensure stability in the `main` and `develop` branches:
+- **`main`**: Production-ready code only.
+- **`develop`**: Integration branch for new features.
+- **Feature Branches**: Branch from `develop` using the format `feature/<issue-id>-<short-description>` (e.g., `feature/MV-123-dicom-viewer`).
+- **Bugfix Branches**: Branch from `develop` (or `main` for hotfixes) using `bugfix/<issue-id>-<description>` or `hotfix/...`.
+
+### 22.2 Code Style Guidelines
+**Frontend (React):**
+- Strictly enforce `ESLint` using our custom `eslint.config.js`.
+- Use Prettier for formatting (set to run on save).
+- React components should prioritize functional components with Hooks. Keep state in Redux or Context where it spans multiple layers.
+
+**Backend (FastAPI):**
+- Python code strictly follows PEP-8 style.
+- Use `black` (line length 88) for automatic formatting.
+- Type hint everything. FastAPI leverages Pydantic strongly, so robust typing is required to auto-generate correct OpenAPI docs.
+
+### 22.3 Commits & Pull Requests
+- We use **Conventional Commits** (e.g., `feat: added AI anomaly detection`, `fix: resolved S3 timeout logic`).
+- PRs must target the `develop` branch.
+- **Requirements for PR Approval:**
+  - All GitHub Actions (Linting, Unit Tests, Build Check) pass.
+  - No new security vulnerabilities introduced (verified via Snyk/Dependabot).
+  - Code review approvals from at least **two** core maintainers.
+  - Relevant documentation, API spec updates, or unit tests included for new logic.
+
+---
+
 ## CONCLUSION
 
 This comprehensive documentation covers MediVault's complete architecture, design, and implementation strategy for a production-grade medical file upload system. The solution addresses critical healthcare challenges through intelligent chunking, AI-driven resilience, and HIPAA-compliant security.
