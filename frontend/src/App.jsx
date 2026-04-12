@@ -14,9 +14,24 @@ import "./App.css";
 const TOAST_TTL_MS = 7000;
 const COMPLETION_REFRESH_MS = 5000;
 const BYTES_PER_GB = 1024 * 1024 * 1024;
+const HISTORY_PAGE_SIZE = 10;
 const DELETE_BUCKET_CONFIRM_PHRASE = "Delete Bucket";
 const BUCKET_NAME_REGEX = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
 const REGION_FORMAT_REGEX = /^[a-z]{2}-[a-z]+-\d+$/;
+const THEME_STORAGE_KEY = "theme";
+const THEME_DARK = "dark";
+const THEME_LIGHT = "light";
+
+function getInitialTheme() {
+  try {
+    const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+    return storedTheme === THEME_DARK || storedTheme === THEME_LIGHT
+      ? storedTheme
+      : THEME_LIGHT;
+  } catch {
+    return THEME_LIGHT;
+  }
+}
 
 function validateBucketPayload(payload) {
   const errors = {};
@@ -134,6 +149,7 @@ function getDetailMessage(error, fallback) {
 
 function App() {
   const [token, setToken] = useState(sessionStorage.getItem("token"));
+  const [theme, setTheme] = useState(getInitialTheme);
   const [authReady, setAuthReady] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
@@ -157,6 +173,7 @@ function App() {
   const [graphToDate, setGraphToDate] = useState("");
   const [historySearchQuery, setHistorySearchQuery] = useState("");
   const [historySortFilter, setHistorySortFilter] = useState("latest");
+  const [historyPage, setHistoryPage] = useState(1);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [showUserDetails, setShowUserDetails] = useState(false);
   const [bucketForm, setBucketForm] = useState({
@@ -188,6 +205,7 @@ function App() {
   const completionRefreshTimerRef = useRef(null);
   const completionNoticeShownRef = useRef(false);
   const userMenuRef = useRef(null);
+  const isDarkMode = theme === THEME_DARK;
 
   const {
     status,
@@ -219,6 +237,10 @@ function App() {
 
   const dismissToast = useCallback((id) => {
     setToasts((prev) => prev.filter((toast) => toast.id !== id));
+  }, []);
+
+  const toggleTheme = useCallback(() => {
+    setTheme((prev) => (prev === THEME_DARK ? THEME_LIGHT : THEME_DARK));
   }, []);
 
   const handleLogout = useCallback(() => {
@@ -444,6 +466,15 @@ function App() {
 
     pushToast("error", "Upload Error", errorMeta.message || "Upload failed unexpectedly.");
   }, [errorMeta, pushToast, handleLogout]);
+
+  useEffect(() => {
+    document.body.classList.toggle("dark", isDarkMode);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // Ignore storage write failures in restricted browser contexts.
+    }
+  }, [isDarkMode, theme]);
 
   useEffect(() => {
     let isActive = true;
@@ -745,22 +776,40 @@ function App() {
     });
 
     const sorted = [...searched].sort((a, b) => {
-      const aName = (a?.filename || a?.file_name || "").toLowerCase();
-      const bName = (b?.filename || b?.file_name || "").toLowerCase();
-      const aSize = Number(a?.size || 0);
-      const bSize = Number(b?.size || 0);
       const aCreated = new Date(a?.created_at || 0).getTime();
       const bCreated = new Date(b?.created_at || 0).getTime();
-
-      if (historySortFilter === "size_asc") return aSize - bSize;
-      if (historySortFilter === "size_desc") return bSize - aSize;
-      if (historySortFilter === "name_asc") return aName.localeCompare(bName);
-      if (historySortFilter === "name_desc") return bName.localeCompare(aName);
       return bCreated - aCreated;
     });
 
     return sorted;
-  }, [history, historySearchQuery, historySortFilter]);
+  }, [history, historySearchQuery]);
+
+  const totalHistoryPages = Math.max(1, Math.ceil(filteredHistoryRecords.length / HISTORY_PAGE_SIZE));
+
+  const paginatedHistoryRecords = useMemo(() => {
+    const startIndex = (historyPage - 1) * HISTORY_PAGE_SIZE;
+    return filteredHistoryRecords.slice(startIndex, startIndex + HISTORY_PAGE_SIZE);
+  }, [filteredHistoryRecords, historyPage]);
+
+  useEffect(() => {
+    setHistoryPage(1);
+  }, [historySearchQuery]);
+
+  useEffect(() => {
+    if (historyPage > totalHistoryPages) {
+      setHistoryPage(totalHistoryPages);
+    }
+  }, [historyPage, totalHistoryPages]);
+
+  const historyPageStart = filteredHistoryRecords.length === 0
+    ? 0
+    : (historyPage - 1) * HISTORY_PAGE_SIZE + 1;
+  const historyPageEnd = Math.min(historyPage * HISTORY_PAGE_SIZE, filteredHistoryRecords.length);
+
+  const chartPalette = useMemo(() => ({
+    axis: isDarkMode ? "rgba(229, 231, 235, 0.45)" : "rgba(116,119,126,0.45)",
+    trend: isDarkMode ? "#5eead4" : "#0f766e",
+  }), [isDarkMode]);
 
   const handleBucketFieldChange = useCallback((field, value) => {
     setBucketForm((prev) => {
@@ -1027,7 +1076,7 @@ function App() {
       <div className="p-6 border-b border-surface-container-high">
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-lg font-extrabold tracking-tight text-primary headline">Upload History</h2>
-          <p className="text-xs font-semibold text-on-surface-variant">{records.length} records</p>
+          <p className="text-xs font-semibold text-on-surface-variant">{filteredHistoryRecords.length} records</p>
         </div>
         <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
           <input
@@ -1041,12 +1090,9 @@ function App() {
             className="w-full rounded-lg bg-surface-container-highest border border-surface-container-high px-3 py-2 text-sm"
             value={historySortFilter}
             onChange={(event) => setHistorySortFilter(event.target.value)}
+            disabled
           >
             <option value="latest">Latest first</option>
-            <option value="size_asc">Size ascending</option>
-            <option value="size_desc">Size descending</option>
-            <option value="name_asc">Name A-Z</option>
-            <option value="name_desc">Name Z-A</option>
           </select>
         </div>
       </div>
@@ -1087,6 +1133,29 @@ function App() {
             )}
           </tbody>
         </table>
+      </div>
+      <div className="px-6 py-3 border-t border-surface-container-high flex items-center justify-end gap-3 text-xs font-semibold text-on-surface-variant">
+        <span>{historyPageStart}-{historyPageEnd} of {filteredHistoryRecords.length}</span>
+        <button
+          type="button"
+          onClick={() => setHistoryPage((prev) => Math.max(1, prev - 1))}
+          disabled={historyPage <= 1}
+          className="rounded-md bg-surface-container-high px-2.5 py-1.5 text-primary disabled:opacity-50"
+          aria-label="Previous history page"
+          title="Previous"
+        >
+          <span className="material-symbols-outlined text-base leading-none">chevron_left</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setHistoryPage((prev) => Math.min(totalHistoryPages, prev + 1))}
+          disabled={historyPage >= totalHistoryPages}
+          className="rounded-md bg-surface-container-high px-2.5 py-1.5 text-primary disabled:opacity-50"
+          aria-label="Next history page"
+          title="Next"
+        >
+          <span className="material-symbols-outlined text-base leading-none">chevron_right</span>
+        </button>
       </div>
     </div>
   );
@@ -1180,13 +1249,13 @@ function App() {
 
                   return (
                     <svg className="w-full h-[200px]" viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label="Upload size by date chart">
-                      <line x1={leftPadding} y1={chartHeight - bottomPadding} x2={chartWidth - rightPadding} y2={chartHeight - bottomPadding} stroke="rgba(116,119,126,0.45)" strokeWidth="1" />
+                      <line x1={leftPadding} y1={chartHeight - bottomPadding} x2={chartWidth - rightPadding} y2={chartHeight - bottomPadding} stroke={chartPalette.axis} strokeWidth="1" />
 
                       {points.length > 1 ? (
                         <path
                           d={trendPath}
                           fill="none"
-                          stroke="#0f766e"
+                          stroke={chartPalette.trend}
                           strokeWidth="2"
                           strokeLinecap="round"
                           strokeLinejoin="round"
@@ -1196,7 +1265,7 @@ function App() {
 
                       {points.map((point) => (
                         <g key={point.key}>
-                          <circle cx={point.x} cy={point.y} r="3.2" fill="#0f766e" />
+                          <circle cx={point.x} cy={point.y} r="3.2" fill={chartPalette.trend} />
                           <title>{`${formatBytes(point.size)} on ${point.dateKey}`}</title>
                         </g>
                       ))}
@@ -1207,7 +1276,7 @@ function App() {
 
               <div className="flex items-center gap-4 text-[11px] font-bold text-on-surface-variant">
                 <div className="flex items-center gap-2">
-                  <span className="inline-block w-3 h-3 rounded-full bg-teal-700"></span>
+                  <span className="inline-block w-3 h-3 rounded-full" style={{ backgroundColor: chartPalette.trend }}></span>
                   <span>Each dot = one upload</span>
                 </div>
               </div>
@@ -1919,7 +1988,7 @@ function App() {
         <h1 className="text-3xl font-extrabold tracking-tighter headline text-primary">History</h1>
         <p className="text-sm text-on-surface-variant font-medium mt-1">Complete upload records from server data.</p>
       </div>
-      {renderHistoryTable(filteredHistoryRecords, "No upload records found for the selected search/filter.")}
+      {renderHistoryTable(paginatedHistoryRecords, "No upload records found for the selected search/filter.")}
     </main>
   );
 
@@ -1962,7 +2031,7 @@ function App() {
 
   return (
     <div className="bg-background text-on-surface min-h-screen flex flex-col font-body">
-      <header className="sticky top-0 z-50 w-full bg-slate-50/90 backdrop-blur-2xl border-b border-surface-container-high">
+      <header className={`sticky top-0 z-50 w-full backdrop-blur-2xl border-b border-surface-container-high ${isDarkMode ? "bg-surface-container-low" : "bg-slate-50/90"}`}>
         <div className="flex flex-col w-full max-w-[1440px] mx-auto px-6 lg:px-10 gap-4 py-4 headline tracking-tight antialiased">
           <div className="flex items-center justify-between gap-6">
             <div className="text-2xl font-extrabold tracking-tighter text-primary">MediVault</div>
@@ -1974,6 +2043,19 @@ function App() {
                 className="px-3 py-2 rounded-lg bg-surface-container-low text-xs font-bold text-primary"
               >
                 Refresh
+              </button>
+
+              <button
+                type="button"
+                onClick={toggleTheme}
+                className="px-3 py-2 rounded-lg bg-surface-container-low text-xs font-bold text-primary hover:bg-surface-container-high transition-colors flex items-center gap-1.5"
+                aria-label={isDarkMode ? "Switch to light mode" : "Switch to dark mode"}
+                title={isDarkMode ? "Switch to light mode" : "Switch to dark mode"}
+              >
+                <span className="material-symbols-outlined text-base leading-none">
+                  {isDarkMode ? "light_mode" : "dark_mode"}
+                </span>
+                <span>{isDarkMode ? "Light" : "Dark"}</span>
               </button>
 
               <div className="relative">
