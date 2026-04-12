@@ -1,13 +1,62 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+from bson import ObjectId
+from bson.errors import InvalidId
 
-from app.database import upload_sessions_collection
-from app.s3_client import abort_multipart_upload
+from app.config import get_settings
+from app.database import upload_sessions_collection, bucket_credentials_collection
+from app.encryption_utils import decrypt_value
+from app.s3_client import abort_multipart_upload, create_s3_client
 
 logger = logging.getLogger(__name__)
 
 CLEANUP_TARGET_STATUSES = ["in_progress", "cleanup_failed"]
+
+
+def _resolve_session_bucket_context(session: dict):
+    if get_settings().USE_MOCK_S3:
+        return None, (session.get("bucket_name") or "").strip() or None
+
+    user_id = session.get("user_id")
+    bucket_id = (session.get("bucket_id") or "").strip()
+    bucket_name = (session.get("bucket_name") or "").strip()
+    if not user_id or (not bucket_id and not bucket_name):
+        raise ValueError("Missing bucket context on upload session")
+
+    query = {"user_id": user_id}
+    if bucket_id:
+        try:
+            query["_id"] = ObjectId(bucket_id)
+        except (InvalidId, TypeError):
+            raise ValueError("Invalid bucket id on upload session")
+    if bucket_name:
+        query["bucket_name"] = bucket_name
+
+    bucket_record = bucket_credentials_collection.find_one(
+        query,
+        {
+            "bucket_name": 1,
+            "region": 1,
+            "access_key_encrypted": 1,
+            "secret_key_encrypted": 1,
+        },
+    )
+    if not bucket_record:
+        raise ValueError("Bucket credentials not found for upload session")
+
+    try:
+        access_key = decrypt_value(bucket_record["access_key_encrypted"])
+        secret_key = decrypt_value(bucket_record["secret_key_encrypted"])
+    except ValueError as e:
+        raise ValueError("Bucket credentials are invalid") from e
+
+    resolved_bucket_name = (bucket_record.get("bucket_name") or "").strip()
+    region = (bucket_record.get("region") or "").strip()
+    if not resolved_bucket_name or not region:
+        raise ValueError("Bucket metadata is incomplete")
+
+    return create_s3_client(access_key, secret_key, region), resolved_bucket_name
 
 
 def cleanup_expired_upload_sessions_once(limit: int = 200) -> None:
@@ -52,7 +101,8 @@ def cleanup_expired_upload_sessions_once(limit: int = 200) -> None:
             continue
 
         try:
-            abort_multipart_upload(file_key, upload_id)
+            s3_client, bucket_name = _resolve_session_bucket_context(session)
+            abort_multipart_upload(file_key, upload_id, s3_client=s3_client, bucket_name=bucket_name)
             upload_sessions_collection.update_one(
                 {"_id": session_id},
                 {

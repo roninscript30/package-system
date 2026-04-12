@@ -75,14 +75,20 @@ def initiate_multipart_upload(
     user_id: str = "anonymous",
     s3_client: Any = None,
     bucket_name: str | None = None,
+    use_kms: bool = False,
+    kms_key_id: str | None = None,
 ) -> dict:
     """Start a multipart upload → returns upload_id + file_key."""
     if _use_mock_s3():
         return mock_s3_service.start_multipart_upload(file_name, content_type, user_id)
 
-    settings = get_settings()
-    s3 = s3_client or _get_s3_client()
-    bucket = bucket_name or settings.S3_BUCKET_NAME
+    if not bucket_name:
+        raise ValueError("No bucket selected")
+    if s3_client is None:
+        raise ValueError("Bucket credentials context is required")
+
+    s3 = s3_client
+    bucket = bucket_name
 
     safe_user_id = _sanitize_path_component(user_id, fallback="anonymous")
     safe_file_name = _sanitize_filename(file_name)
@@ -91,10 +97,15 @@ def initiate_multipart_upload(
     unique_id = uuid.uuid4().hex[:12]
     file_key = f"medical-uploads/{safe_user_id}/{date_prefix}/{timestamp}_{unique_id}_{safe_file_name}"
 
-    response = s3.create_multipart_upload(
-        Bucket=bucket,
-        Key=file_key,
-    )
+    create_args = {
+        "Bucket": bucket,
+        "Key": file_key,
+    }
+    if use_kms and kms_key_id:
+        create_args["ServerSideEncryption"] = "aws:kms"
+        create_args["SSEKMSKeyId"] = kms_key_id
+
+    response = s3.create_multipart_upload(**create_args)
 
     return {"upload_id": response["UploadId"], "file_key": file_key}
 
@@ -111,8 +122,13 @@ def generate_presigned_url(
         return mock_s3_service.generate_presigned_part_url(file_key, upload_id, part_number)
 
     settings = get_settings()
-    s3 = s3_client or _get_s3_client()
-    bucket = bucket_name or settings.S3_BUCKET_NAME
+    if not bucket_name:
+        raise ValueError("No bucket selected")
+    if s3_client is None:
+        raise ValueError("Bucket credentials context is required")
+
+    s3 = s3_client
+    bucket = bucket_name
 
     return s3.generate_presigned_url(
         ClientMethod="upload_part",
@@ -137,9 +153,13 @@ def complete_multipart_upload(
     if _use_mock_s3():
         return mock_s3_service.complete_multipart_upload(file_key, upload_id, parts)
 
-    settings = get_settings()
-    s3 = s3_client or _get_s3_client()
-    bucket = bucket_name or settings.S3_BUCKET_NAME
+    if not bucket_name:
+        raise ValueError("No bucket selected")
+    if s3_client is None:
+        raise ValueError("Bucket credentials context is required")
+
+    s3 = s3_client
+    bucket = bucket_name
 
     sorted_parts = sorted(parts, key=lambda p: p["PartNumber"])
 
@@ -166,9 +186,13 @@ def abort_multipart_upload(
     if _use_mock_s3():
         return mock_s3_service.abort_multipart_upload(file_key, upload_id)
 
-    settings = get_settings()
-    s3 = s3_client or _get_s3_client()
-    bucket = bucket_name or settings.S3_BUCKET_NAME
+    if not bucket_name:
+        raise ValueError("No bucket selected")
+    if s3_client is None:
+        raise ValueError("Bucket credentials context is required")
+
+    s3 = s3_client
+    bucket = bucket_name
 
     s3.abort_multipart_upload(
         Bucket=bucket,

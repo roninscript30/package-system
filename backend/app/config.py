@@ -4,6 +4,7 @@ from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
+    # Legacy-only fallbacks; multipart upload routes resolve per-user bucket credentials from MongoDB.
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "ap-south-1"

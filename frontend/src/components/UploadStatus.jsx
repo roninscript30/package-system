@@ -31,7 +31,14 @@ const STATUS_CONFIG = {
   },
 };
 
-export default function UploadStatus({ status, error, networkType = "Medium", displayChunkMB = 5 }) {
+export default function UploadStatus({
+  status,
+  error,
+  networkType = "Medium",
+  displayChunkMB = 5,
+  etaDisplay = "Calculating...",
+  targetBucketName = "MediVault Bucket",
+}) {
   if (status === "idle") return null;
 
   const config = STATUS_CONFIG[status];
@@ -52,9 +59,11 @@ export default function UploadStatus({ status, error, networkType = "Medium", di
           {status === "error" && error ? error : config.description}
         </p>
         <div className="mt-2 text-[11px] font-semibold text-on-surface-variant space-y-0.5">
+          <p>Uploading to: {targetBucketName}</p>
           <p>Adaptive Mode: ON</p>
           <p>Network: {networkLabel}</p>
           <p>Chunk Size: {displayChunkMB} MB</p>
+          <p>Estimated Time Remaining: {etaDisplay}</p>
         </div>
       </div>
     </div>

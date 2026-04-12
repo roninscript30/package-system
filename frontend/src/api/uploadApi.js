@@ -34,11 +34,12 @@ export async function startUpload(
   return data;
 }
 
-export async function getPresignedUrl(fileKey, uploadId, partNumber) {
+export async function getPresignedUrl(fileKey, uploadId, partNumber, bucketName = null) {
   const { data } = await api.post("/presigned-url", {
     file_key: fileKey,
     upload_id: uploadId,
     part_number: partNumber,
+    bucket_name: bucketName || undefined,
   });
   return data;
 }
@@ -54,9 +55,14 @@ export async function updatePart(fileId, fileKey, uploadId, partNumber, etag) {
   return data;
 }
 
-export async function resumeSession(fileId) {
+export async function resumeSession(fileId, bucketName = null) {
   try {
-    const { data } = await api.get(`/resume-session?file_id=${encodeURIComponent(fileId)}`);
+    const query = new URLSearchParams({ file_id: fileId });
+    if (bucketName) {
+      query.set("bucket_name", bucketName);
+    }
+
+    const { data } = await api.get(`/resume-session?${query.toString()}`);
 
     if (data && data.has_session === false) {
       return null;
@@ -71,7 +77,7 @@ export async function resumeSession(fileId) {
   }
 }
 
-export async function completeUpload(fileId, fileKey, uploadId, fileName, size, parts, checksum) {
+export async function completeUpload(fileId, fileKey, uploadId, fileName, size, parts, checksum, bucketName = null) {
   const { data } = await api.post("/complete-upload", {
     file_id: fileId,
     file_key: fileKey,
@@ -79,15 +85,17 @@ export async function completeUpload(fileId, fileKey, uploadId, fileName, size, 
     file_name: fileName,
     size,
     checksum,
+    bucket_name: bucketName || undefined,
     parts,
   });
   return data;
 }
 
-export async function abortUpload(fileKey, uploadId) {
+export async function abortUpload(fileKey, uploadId, bucketName = null) {
   const { data } = await api.post("/abort", {
     file_key: fileKey,
     upload_id: uploadId,
+    bucket_name: bucketName || undefined,
   });
   return data;
 }
@@ -116,6 +124,11 @@ export async function addBucket(bucketPayload) {
 
 export async function deleteBucket(bucketId) {
   const { data } = await api.delete(`/buckets/${encodeURIComponent(bucketId)}`);
+  return data;
+}
+
+export async function updateBucket(bucketId, bucketPayload) {
+  const { data } = await api.patch(`/buckets/${encodeURIComponent(bucketId)}`, bucketPayload);
   return data;
 }
 
