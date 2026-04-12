@@ -22,6 +22,7 @@ from app.schemas import (
     ResumeSessionResponse,
     AddBucketRequest, AddBucketResponse,
     BucketSummary,
+    UpdateBucketRequest,
     DeleteBucketResponse,
     BucketUsageResponse,
 )
@@ -190,29 +191,64 @@ def _handle_s3_error(action: str, e: Exception):
     raise HTTPException(status_code=500, detail=f"{action} failed: {str(e)}")
 
 
-def _get_user_bucket_context(
+def _normalize_bucket_selector(
+    bucket_id: str | None,
+    bucket_name: str | None,
+) -> tuple[str | None, str | None]:
+    normalized_bucket_id = (bucket_id or "").strip() or None
+    normalized_bucket_name = (bucket_name or "").strip() or None
+    return normalized_bucket_id, normalized_bucket_name
+
+
+def _resolve_user_bucket_record(
     username: str,
-    preferred_bucket: str | None = None,
-    strict_preferred: bool = False,
+    bucket_id: str | None = None,
+    bucket_name: str | None = None,
 ):
-    settings = get_settings()
-
-    if settings.USE_MOCK_S3:
-        return None, settings.S3_BUCKET_NAME
-
-    # Allow selecting the built-in MediVault bucket from UI without requiring saved user credentials.
-    if preferred_bucket and preferred_bucket == settings.S3_BUCKET_NAME:
-        return None, settings.S3_BUCKET_NAME
+    normalized_bucket_id, normalized_bucket_name = _normalize_bucket_selector(bucket_id, bucket_name)
+    if not normalized_bucket_id and not normalized_bucket_name:
+        raise HTTPException(status_code=400, detail="No bucket selected")
 
     query = {"user_id": username}
-    if preferred_bucket:
-        query["bucket_name"] = preferred_bucket
+    if normalized_bucket_id:
+        try:
+            query["_id"] = ObjectId(normalized_bucket_id)
+        except (InvalidId, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid bucket id")
+    if normalized_bucket_name:
+        query["bucket_name"] = normalized_bucket_name
 
     bucket_record = bucket_credentials_collection.find_one(query, sort=[("created_at", -1)])
     if not bucket_record:
-        if preferred_bucket and strict_preferred:
-            raise HTTPException(status_code=404, detail=f"Selected bucket '{preferred_bucket}' not found")
-        return None, settings.S3_BUCKET_NAME
+        raise HTTPException(status_code=404, detail="Selected bucket not found")
+
+    return bucket_record
+
+
+def _get_user_bucket_context(
+    username: str,
+    bucket_id: str | None = None,
+    bucket_name: str | None = None,
+):
+    bucket_record = _resolve_user_bucket_record(username, bucket_id=bucket_id, bucket_name=bucket_name)
+
+    resolved_bucket_name = (bucket_record.get("bucket_name") or "").strip()
+    if not _is_valid_s3_bucket_name(resolved_bucket_name):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Saved bucket name '{resolved_bucket_name}' is invalid. "
+                "Delete it and add a valid S3 bucket name."
+            ),
+        )
+
+    use_kms = bool(bucket_record.get("use_kms", False))
+    kms_key_id = (bucket_record.get("kms_key_id") or "").strip() or None
+    if use_kms and not kms_key_id:
+        raise HTTPException(status_code=400, detail="KMS key is required when KMS encryption is enabled for selected bucket")
+
+    if get_settings().USE_MOCK_S3:
+        return None, resolved_bucket_name, str(bucket_record["_id"]), use_kms, kms_key_id
 
     try:
         access_key = decrypt_value(bucket_record["access_key_encrypted"])
@@ -220,26 +256,15 @@ def _get_user_bucket_context(
     except ValueError as e:
         raise HTTPException(status_code=500, detail="Stored bucket credentials are invalid") from e
 
-    bucket_name = bucket_record["bucket_name"]
     configured_region = (bucket_record.get("region") or "").strip()
-
-    if not _is_valid_s3_bucket_name(bucket_name):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Saved bucket name '{bucket_name}' is invalid. "
-                "Delete it and add a valid S3 bucket name."
-            ),
-        )
-
     available_regions = _get_available_s3_regions()
     if configured_region not in available_regions:
-        detected_region = _discover_bucket_region(access_key, secret_key, bucket_name)
+        detected_region = _discover_bucket_region(access_key, secret_key, resolved_bucket_name)
         if not detected_region:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Invalid AWS region '{configured_region}' for bucket '{bucket_name}'. "
+                    f"Invalid AWS region '{configured_region}' for bucket '{resolved_bucket_name}'. "
                     "Delete and re-add bucket with a valid region (e.g. ap-south-1)."
                 ),
             )
@@ -257,7 +282,7 @@ def _get_user_bucket_context(
         configured_region = detected_region
 
     client = create_s3_client(access_key, secret_key, configured_region)
-    return client, bucket_record["bucket_name"]
+    return client, resolved_bucket_name, str(bucket_record["_id"]), use_kms, kms_key_id
 
 
 def _extract_bucket_region_from_error(error: ClientError) -> str | None:
@@ -346,11 +371,11 @@ async def start_upload(request: Request, payload: StartUploadRequest, username: 
                 detail="Unsupported file extension. Allowed extensions: .dcm, .dicom, .jpg, .jpeg, .png, .pdf, .zip",
             )
 
-        preferred_bucket = (payload.bucket_name or "").strip() or None
-        s3_client, bucket_name = _get_user_bucket_context(
+        selected_bucket_id, selected_bucket_name = _normalize_bucket_selector(payload.bucket_id, payload.bucket_name)
+        s3_client, bucket_name, bucket_id, use_kms, kms_key_id = _get_user_bucket_context(
             username,
-            preferred_bucket=preferred_bucket,
-            strict_preferred=bool(preferred_bucket),
+            bucket_id=selected_bucket_id,
+            bucket_name=selected_bucket_name,
         )
         result = initiate_multipart_upload(
             payload.file_name,
@@ -358,6 +383,8 @@ async def start_upload(request: Request, payload: StartUploadRequest, username: 
             username,
             s3_client=s3_client,
             bucket_name=bucket_name,
+            use_kms=use_kms,
+            kms_key_id=kms_key_id,
         )
         total_parts = _calculate_total_parts(payload.size)
         
@@ -365,7 +392,10 @@ async def start_upload(request: Request, payload: StartUploadRequest, username: 
             "user_id": username,
             "file_id": payload.file_id,
             "filename": payload.file_name,
+            "bucket_id": bucket_id,
             "bucket_name": bucket_name,
+            "use_kms": use_kms,
+            "kms_key_id": kms_key_id,
             "size": payload.size,
             "checksum": payload.checksum,
             "total_parts": total_parts,
@@ -379,10 +409,15 @@ async def start_upload(request: Request, payload: StartUploadRequest, username: 
         })
 
         logger.info(
-            "Started upload session user_id=%s file_id=%s upload_id=%s total_parts=%s",
+            "Started upload session user_id=%s file_id=%s upload_id=%s requested_bucket_id=%s requested_bucket_name=%s resolved_bucket_id=%s resolved_bucket_name=%s use_kms=%s total_parts=%s",
             username,
             payload.file_id,
             result["upload_id"],
+            selected_bucket_id,
+            selected_bucket_name,
+            bucket_id,
+            bucket_name,
+            use_kms,
             total_parts,
         )
         
@@ -393,15 +428,37 @@ async def start_upload(request: Request, payload: StartUploadRequest, username: 
 
 @router.get("/resume-session", response_model=ResumeSessionResponse)
 @limiter.limit("120/minute")
-async def resume_session(request: Request, file_id: str, username: str = Depends(get_current_user)):
-    logger.info("Resume session requested user_id=%s file_id=%s", username, file_id)
+async def resume_session(
+    request: Request,
+    file_id: str,
+    bucket_id: str | None = Query(default=None),
+    bucket_name: str | None = Query(default=None),
+    username: str = Depends(get_current_user),
+):
+    selected_bucket = _resolve_user_bucket_record(username, bucket_id=bucket_id, bucket_name=bucket_name)
+    selected_bucket_id = str(selected_bucket["_id"])
+    selected_bucket_name = selected_bucket.get("bucket_name")
+    logger.info(
+        "Resume session requested user_id=%s file_id=%s requested_bucket_id=%s requested_bucket_name=%s",
+        username,
+        file_id,
+        selected_bucket_id,
+        selected_bucket_name,
+    )
 
     try:
-        session = upload_sessions_collection.find_one({
+        session_query = {
             "user_id": username,
             "file_id": file_id,
             "status": "in_progress",
-        })
+            "bucket_name": selected_bucket_name,
+        }
+        session_query["$or"] = [
+            {"bucket_id": selected_bucket_id},
+            {"bucket_id": {"$exists": False}},
+        ]
+
+        session = upload_sessions_collection.find_one(session_query, sort=[("_id", -1)])
     except Exception as e:
         logger.exception("Resume session query failed user_id=%s file_id=%s", username, file_id)
         raise HTTPException(status_code=500, detail="Failed to fetch upload session") from e
@@ -412,6 +469,8 @@ async def resume_session(request: Request, file_id: str, username: str = Depends
             "has_session": False,
             "upload_id": None,
             "file_key": None,
+            "bucket_id": None,
+            "bucket_name": None,
             "uploaded_part_numbers": [],
             "total_parts": 0,
         }
@@ -444,6 +503,8 @@ async def resume_session(request: Request, file_id: str, username: str = Depends
         "has_session": True,
         "upload_id": session["upload_id"],
         "file_key": session["file_key"],
+        "bucket_id": session.get("bucket_id"),
+        "bucket_name": session.get("bucket_name"),
         "uploaded_part_numbers": uploaded_part_numbers,
         "total_parts": total_parts,
     }
@@ -533,11 +594,31 @@ async def update_part(request: Request, payload: UpdatePartRequest, username: st
 async def get_presigned_url(request: Request, payload: PresignedUrlRequest, username: str = Depends(get_current_user)):
     try:
         session = upload_sessions_collection.find_one(
-            {"upload_id": payload.upload_id, "user_id": username},
-            {"bucket_name": 1},
+            {
+                "upload_id": payload.upload_id,
+                "user_id": username,
+                "status": "in_progress",
+                "file_key": payload.file_key,
+            },
+            {"bucket_id": 1, "bucket_name": 1},
         )
-        preferred_bucket = session.get("bucket_name") if session else None
-        s3_client, bucket_name = _get_user_bucket_context(username, preferred_bucket)
+        if not session:
+            raise HTTPException(status_code=404, detail="Active upload session not found")
+
+        requested_bucket_id, requested_bucket_name = _normalize_bucket_selector(payload.bucket_id, payload.bucket_name)
+        session_bucket_id = (session.get("bucket_id") or "").strip() or None
+        session_bucket_name = (session.get("bucket_name") or "").strip() or None
+
+        if requested_bucket_id and requested_bucket_id != session_bucket_id:
+            raise HTTPException(status_code=409, detail="Requested bucket does not match upload session bucket")
+        if requested_bucket_name and requested_bucket_name != session_bucket_name:
+            raise HTTPException(status_code=409, detail="Requested bucket does not match upload session bucket")
+
+        s3_client, bucket_name, _, _, _ = _get_user_bucket_context(
+            username,
+            bucket_id=session_bucket_id,
+            bucket_name=session_bucket_name,
+        )
         url = generate_presigned_url(
             payload.file_key,
             payload.upload_id,
@@ -581,6 +662,14 @@ async def complete_upload(request: Request, payload: CompleteUploadRequest, user
 
     if not session:
         raise HTTPException(status_code=404, detail="Active upload session not found")
+
+    requested_bucket_id, requested_bucket_name = _normalize_bucket_selector(payload.bucket_id, payload.bucket_name)
+    session_bucket_id = (session.get("bucket_id") or "").strip() or None
+    session_bucket_name = (session.get("bucket_name") or "").strip() or None
+    if requested_bucket_id and requested_bucket_id != session_bucket_id:
+        raise HTTPException(status_code=409, detail="Requested bucket does not match upload session bucket")
+    if requested_bucket_name and requested_bucket_name != session_bucket_name:
+        raise HTTPException(status_code=409, detail="Requested bucket does not match upload session bucket")
 
     session_filename = session.get("filename")
     session_size = session.get("size")
@@ -656,7 +745,11 @@ async def complete_upload(request: Request, payload: CompleteUploadRequest, user
         ordered_parts.append({"PartNumber": part_number, "ETag": etag})
 
     try:
-        s3_client, bucket_name = _get_user_bucket_context(username, session.get("bucket_name"))
+        s3_client, bucket_name, _, _, _ = _get_user_bucket_context(
+            username,
+            bucket_id=session_bucket_id,
+            bucket_name=session_bucket_name,
+        )
         result = complete_multipart_upload(
             payload.file_key,
             payload.upload_id,
@@ -712,8 +805,20 @@ async def abort_upload(request: Request, payload: AbortUploadRequest, username: 
     if not session:
         raise HTTPException(status_code=404, detail="Active upload session not found")
 
+    requested_bucket_id, requested_bucket_name = _normalize_bucket_selector(payload.bucket_id, payload.bucket_name)
+    session_bucket_id = (session.get("bucket_id") or "").strip() or None
+    session_bucket_name = (session.get("bucket_name") or "").strip() or None
+    if requested_bucket_id and requested_bucket_id != session_bucket_id:
+        raise HTTPException(status_code=409, detail="Requested bucket does not match upload session bucket")
+    if requested_bucket_name and requested_bucket_name != session_bucket_name:
+        raise HTTPException(status_code=409, detail="Requested bucket does not match upload session bucket")
+
     try:
-        s3_client, bucket_name = _get_user_bucket_context(username, session.get("bucket_name"))
+        s3_client, bucket_name, _, _, _ = _get_user_bucket_context(
+            username,
+            bucket_id=session_bucket_id,
+            bucket_name=session_bucket_name,
+        )
         result = abort_multipart_upload(
             payload.file_key,
             payload.upload_id,
@@ -782,8 +887,14 @@ async def get_file_url(request: Request, payload: FileUrlRequest, username: str 
 async def add_bucket(request: Request, payload: AddBucketRequest, username: str = Depends(get_current_user)):
     bucket_name = payload.bucket_name.strip()
     resolved_region = payload.region.strip()
+    use_kms = bool(payload.use_kms)
+    kms_key_id = (payload.kms_key_id or "").strip() or None
+    notes = (payload.notes or "").strip()
     validation_status = "verified"
     success_message = "Bucket credentials saved securely"
+
+    if use_kms and not kms_key_id:
+        raise HTTPException(status_code=400, detail="kms_key_id is required when use_kms is enabled")
 
     if not _is_valid_s3_bucket_name(bucket_name):
         raise HTTPException(
@@ -849,6 +960,9 @@ async def add_bucket(request: Request, payload: AddBucketRequest, username: str 
                 "$set": {
                     "region": resolved_region,
                     "size_limit": int(payload.size_limit or DEFAULT_BUCKET_SIZE_LIMIT_BYTES),
+                    "use_kms": use_kms,
+                    "kms_key_id": kms_key_id,
+                    "notes": notes,
                     "access_key_encrypted": encrypt_value(payload.aws_access_key_id),
                     "secret_key_encrypted": encrypt_value(payload.aws_secret_access_key),
                     "validation_status": validation_status,
@@ -857,6 +971,7 @@ async def add_bucket(request: Request, payload: AddBucketRequest, username: str 
                 "$setOnInsert": {
                     "user_id": username,
                     "bucket_name": bucket_name,
+                    "display_name": bucket_name,
                     "created_at": now_iso,
                 },
             },
@@ -939,8 +1054,12 @@ async def list_buckets(request: Request, username: str = Depends(get_current_use
             {
                 "id": str(record["_id"]),
                 "bucket_name": record_bucket_name,
+                "display_name": record.get("display_name") or record_bucket_name,
                 "region": record.get("region", ""),
                 "size_limit": int(record.get("size_limit") or DEFAULT_BUCKET_SIZE_LIMIT_BYTES),
+                "use_kms": bool(record.get("use_kms", False)),
+                "kms_key_id": (record.get("kms_key_id") or "").strip() or None,
+                "notes": record.get("notes", ""),
                 "created_at": record.get("created_at", ""),
                 "validation_status": record.get("validation_status", "verified"),
                 "system_default": bool(record_bucket_name == settings.S3_BUCKET_NAME),
@@ -954,8 +1073,12 @@ async def list_buckets(request: Request, username: str = Depends(get_current_use
             {
                 "id": "default-medivault",
                 "bucket_name": settings.S3_BUCKET_NAME,
+                "display_name": settings.S3_BUCKET_NAME,
                 "region": settings.AWS_REGION,
                 "size_limit": DEFAULT_BUCKET_SIZE_LIMIT_BYTES,
+                "use_kms": False,
+                "kms_key_id": None,
+                "notes": "",
                 "created_at": "",
                 "validation_status": "verified",
                 "system_default": True,
@@ -963,6 +1086,98 @@ async def list_buckets(request: Request, username: str = Depends(get_current_use
         )
 
     return sanitized_records
+
+
+@router.patch("/buckets/{bucket_id}", response_model=BucketSummary)
+@limiter.limit("60/minute")
+async def update_bucket(
+    request: Request,
+    bucket_id: str,
+    payload: UpdateBucketRequest,
+    username: str = Depends(get_current_user),
+):
+    if bucket_id == "default-medivault":
+        raise HTTPException(status_code=403, detail="MediVault bucket cannot be edited")
+
+    try:
+        object_id = ObjectId(bucket_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid bucket id")
+
+    bucket_record = bucket_credentials_collection.find_one({"_id": object_id, "user_id": username})
+    if not bucket_record:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+
+    updates: dict[str, object] = {"updated_at": datetime.now(timezone.utc).isoformat()}
+
+    if payload.display_name is not None:
+        display_name = payload.display_name.strip()
+        if not display_name:
+            raise HTTPException(status_code=400, detail="display_name cannot be empty")
+        updates["display_name"] = display_name
+
+    if payload.notes is not None:
+        updates["notes"] = payload.notes.strip()
+
+    existing_use_kms = bool(bucket_record.get("use_kms", False))
+    existing_kms_key_id = (bucket_record.get("kms_key_id") or "").strip() or None
+
+    next_use_kms = existing_use_kms if payload.use_kms is None else bool(payload.use_kms)
+    next_kms_key_id = existing_kms_key_id
+
+    if payload.kms_key_id is not None:
+        parsed_kms_key_id = payload.kms_key_id.strip() or None
+        updates["kms_key_id"] = parsed_kms_key_id
+        next_kms_key_id = parsed_kms_key_id
+
+    if payload.use_kms is not None:
+        updates["use_kms"] = next_use_kms
+        if not next_use_kms and payload.kms_key_id is None:
+            updates["kms_key_id"] = None
+            next_kms_key_id = None
+
+    if next_use_kms and not next_kms_key_id:
+        raise HTTPException(status_code=400, detail="kms_key_id is required when use_kms is enabled")
+
+    if payload.size_limit is not None:
+        if payload.size_limit <= 0:
+            raise HTTPException(status_code=400, detail="size_limit must be greater than 0")
+        updates["size_limit"] = int(payload.size_limit)
+
+    if payload.region is not None:
+        region = payload.region.strip()
+        if not region:
+            raise HTTPException(status_code=400, detail="region cannot be empty")
+        if region not in _get_available_s3_regions():
+            raise HTTPException(status_code=400, detail=f"Invalid AWS region '{region}'")
+        updates["region"] = region
+
+    if len(updates) == 1:
+        raise HTTPException(status_code=400, detail="No updatable bucket fields provided")
+
+    bucket_credentials_collection.update_one(
+        {"_id": object_id, "user_id": username},
+        {"$set": updates},
+    )
+
+    refreshed = bucket_credentials_collection.find_one({"_id": object_id, "user_id": username})
+    if not refreshed:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+
+    record_bucket_name = refreshed.get("bucket_name", "")
+    return {
+        "id": str(refreshed["_id"]),
+        "bucket_name": record_bucket_name,
+        "display_name": refreshed.get("display_name") or record_bucket_name,
+        "region": refreshed.get("region", ""),
+        "size_limit": int(refreshed.get("size_limit") or DEFAULT_BUCKET_SIZE_LIMIT_BYTES),
+        "use_kms": bool(refreshed.get("use_kms", False)),
+        "kms_key_id": (refreshed.get("kms_key_id") or "").strip() or None,
+        "notes": refreshed.get("notes", ""),
+        "created_at": refreshed.get("created_at", ""),
+        "validation_status": refreshed.get("validation_status", "verified"),
+        "system_default": bool(record_bucket_name == get_settings().S3_BUCKET_NAME),
+    }
 
 
 @router.delete("/buckets/{bucket_id}", response_model=DeleteBucketResponse)

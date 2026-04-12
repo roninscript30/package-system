@@ -16,10 +16,27 @@ const MEDIUM_S3_CHUNK_MB = 7;
 const DEFAULT_CHUNK_MB = 5;
 const MB_BYTES = 1024 * 1024;
 const ADAPTIVE_BASELINE_CHUNKS = 2;
-const SPEED_WINDOW_SIZE = 3;
+const SPEED_WINDOW_SIZE = 5;
+const ETA_BASELINE_CHUNKS = 2;
+const ETA_SMOOTHING_PREVIOUS_WEIGHT = 0.7;
+const ETA_SMOOTHING_NEW_WEIGHT = 0.3;
 
 function buildFileId(file) {
   return `${file.name}-${file.size}`;
+}
+
+function normalizeBucketName(bucketName) {
+  return typeof bucketName === "string" ? bucketName.trim().toLowerCase() : "";
+}
+
+function doesSessionMatchSelectedBucket(sessionBucketName, selectedBucketName) {
+  const selected = normalizeBucketName(selectedBucketName);
+  if (!selected) {
+    return true;
+  }
+
+  const session = normalizeBucketName(sessionBucketName);
+  return session.length > 0 && session === selected;
 }
 
 function extractStatus(err) {
@@ -133,6 +150,16 @@ function getNetworkType(speedMB) {
   return "Fast";
 }
 
+function formatEtaSeconds(etaSeconds) {
+  const safeSeconds = Math.max(0, Math.floor(etaSeconds));
+  if (safeSeconds > 60) {
+    const minutes = Math.floor(safeSeconds / 60);
+    const seconds = Math.floor(safeSeconds % 60);
+    return `${minutes} min ${seconds} sec`;
+  }
+  return `${safeSeconds} sec`;
+}
+
 export function useChunkedUpload() {
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState(0);
@@ -143,6 +170,7 @@ export function useChunkedUpload() {
   const [networkType, setNetworkType] = useState("Medium");
   const [displayChunkMB, setDisplayChunkMB] = useState(DEFAULT_CHUNK_MB);
   const [avgUploadSpeedMB, setAvgUploadSpeedMB] = useState(null);
+  const [etaDisplay, setEtaDisplay] = useState("Calculating...");
 
   const isPausedRef = useRef(false);
   const fileRef = useRef(null);
@@ -151,7 +179,11 @@ export function useChunkedUpload() {
   const checksumPromisesRef = useRef(new Map());
   const fileValidationPromisesRef = useRef(new Map());
   const speedSamplesRef = useRef([]);
+  const avgSpeedBytesRef = useRef(0);
   const uploadedChunkCountRef = useRef(0);
+  const uploadedBytesRef = useRef(0);
+  const totalFileSizeBytesRef = useRef(0);
+  const previousEtaSecondsRef = useRef(null);
   const safeChunkSizeBytesRef = useRef(DEFAULT_CHUNK_MB * MB_BYTES);
   const uploadRunIdRef = useRef(0);
   const activeFetchControllersRef = useRef(new Set());
@@ -169,24 +201,62 @@ export function useChunkedUpload() {
 
   const resetAdaptiveMetrics = useCallback(() => {
     speedSamplesRef.current = [];
+    avgSpeedBytesRef.current = 0;
     uploadedChunkCountRef.current = 0;
+    uploadedBytesRef.current = 0;
+    totalFileSizeBytesRef.current = 0;
+    previousEtaSecondsRef.current = null;
     safeChunkSizeBytesRef.current = DEFAULT_CHUNK_MB * MB_BYTES;
     setDisplayChunkMB(DEFAULT_CHUNK_MB);
     setNetworkType("Medium");
     setAvgUploadSpeedMB(null);
+    setEtaDisplay("Calculating...");
+  }, []);
+
+  const updateEtaEstimate = useCallback(() => {
+    if (uploadedChunkCountRef.current < ETA_BASELINE_CHUNKS) {
+      setEtaDisplay("Calculating...");
+      return;
+    }
+
+    const avgSpeedBytes = avgSpeedBytesRef.current;
+    if (!Number.isFinite(avgSpeedBytes) || avgSpeedBytes <= 0) {
+      setEtaDisplay("Calculating...");
+      return;
+    }
+
+    const remainingBytes = Math.max(0, totalFileSizeBytesRef.current - uploadedBytesRef.current);
+    if (remainingBytes <= 0) {
+      setEtaDisplay("0 sec");
+      return;
+    }
+
+    const newEtaSeconds = remainingBytes / avgSpeedBytes;
+    if (!Number.isFinite(newEtaSeconds) || newEtaSeconds <= 0) {
+      setEtaDisplay("Calculating...");
+      return;
+    }
+
+    const previousEta = previousEtaSecondsRef.current;
+    const smoothedEta = Number.isFinite(previousEta)
+      ? (previousEta * ETA_SMOOTHING_PREVIOUS_WEIGHT) + (newEtaSeconds * ETA_SMOOTHING_NEW_WEIGHT)
+      : newEtaSeconds;
+
+    previousEtaSecondsRef.current = smoothedEta;
+    setEtaDisplay(formatEtaSeconds(smoothedEta));
   }, []);
 
   const applyAdaptiveTelemetry = useCallback((chunkSizeBytes, elapsedMs) => {
     try {
       const timeSec = Math.max(elapsedMs / 1000, 0.001);
       const speedBytes = chunkSizeBytes / timeSec;
-      const speedMB = speedBytes / MB_BYTES;
-
-      const nextSamples = [...speedSamplesRef.current, speedMB].slice(-SPEED_WINDOW_SIZE);
+      const nextSamples = [...speedSamplesRef.current, speedBytes].slice(-SPEED_WINDOW_SIZE);
       speedSamplesRef.current = nextSamples;
       uploadedChunkCountRef.current += 1;
 
-      const avgSpeed = nextSamples.reduce((acc, value) => acc + value, 0) / Math.max(nextSamples.length, 1);
+      const avgSpeedBytes = nextSamples.reduce((acc, value) => acc + value, 0) / Math.max(nextSamples.length, 1);
+      avgSpeedBytesRef.current = avgSpeedBytes;
+      const avgSpeed = avgSpeedBytes / MB_BYTES;
       setAvgUploadSpeedMB(avgSpeed);
       setNetworkType(getNetworkType(avgSpeed));
 
@@ -203,10 +273,12 @@ export function useChunkedUpload() {
         MAX_S3_CHUNK_MB,
       ) * MB_BYTES;
     } catch {
+      avgSpeedBytesRef.current = 0;
       safeChunkSizeBytesRef.current = MIN_S3_CHUNK_MB * MB_BYTES;
       setDisplayChunkMB(DEFAULT_CHUNK_MB);
       setNetworkType("Medium");
       setAvgUploadSpeedMB(null);
+      setEtaDisplay("Calculating...");
     }
   }, []);
 
@@ -254,7 +326,7 @@ export function useChunkedUpload() {
     return checksumPromise;
   }, []);
 
-  const prepareUpload = useCallback(async (file) => {
+  const prepareUpload = useCallback(async (file, selectedBucketName = null) => {
     if (!file) {
       preparedSessionRef.current = null;
       return null;
@@ -263,9 +335,13 @@ export function useChunkedUpload() {
     await ensureFileTypeAllowed(file);
 
     const fileId = buildFileId(file);
-    const savedState = await resumeSession(fileId);
+    const normalizedSelectedBucketName = typeof selectedBucketName === "string"
+      ? selectedBucketName.trim()
+      : "";
+    const effectiveSelectedBucketName = normalizedSelectedBucketName || null;
+    const savedState = await resumeSession(fileId, effectiveSelectedBucketName);
 
-    if (savedState) {
+    if (savedState && doesSessionMatchSelectedBucket(savedState.bucket_name, effectiveSelectedBucketName)) {
       const completedPartNumbers = new Set(savedState.uploaded_part_numbers || []);
       const totalParts = savedState.total_parts > 0 ? savedState.total_parts : 0;
 
@@ -274,6 +350,7 @@ export function useChunkedUpload() {
         hasSession: true,
         uploadId: savedState.upload_id,
         fileKey: savedState.file_key,
+        bucketName: savedState.bucket_name || null,
         completedPartNumbers,
         totalParts,
       };
@@ -284,7 +361,7 @@ export function useChunkedUpload() {
     return preparedSessionRef.current;
   }, [ensureFileTypeAllowed]);
 
-  const uploadChunk = async (chunk, fileId, fileKey, uploadId, runId, retryCount = 0) => {
+  const uploadChunk = async (chunk, fileId, fileKey, uploadId, bucketName, runId, retryCount = 0) => {
     try {
       if (runId !== uploadRunIdRef.current) {
         const staleError = new Error("Stale upload run");
@@ -292,7 +369,7 @@ export function useChunkedUpload() {
         throw staleError;
       }
 
-      const { url } = await getPresignedUrl(fileKey, uploadId, chunk.partNumber);
+      const { url } = await getPresignedUrl(fileKey, uploadId, chunk.partNumber, bucketName);
 
       const startTime = Date.now();
       const controller = new AbortController();
@@ -365,7 +442,7 @@ export function useChunkedUpload() {
       if (retryCount < MAX_RETRIES) {
         const delay = RETRY_BASE_DELAY * Math.pow(2, retryCount);
         await new Promise((r) => setTimeout(r, delay));
-        return uploadChunk(chunk, fileId, fileKey, uploadId, runId, retryCount + 1);
+        return uploadChunk(chunk, fileId, fileKey, uploadId, bucketName, runId, retryCount + 1);
       }
 
       const exhaustedError = new Error("Chunk upload failed after maximum retries");
@@ -377,7 +454,17 @@ export function useChunkedUpload() {
     }
   };
 
-  const uploadWithPool = async (chunks, fileId, fileKey, uploadId, runId, completedPartNumbers, totalPartsHint = 0) => {
+  const uploadWithPool = async (
+    chunks,
+    fileId,
+    fileKey,
+    uploadId,
+    bucketName,
+    runId,
+    totalFileSizeBytes,
+    completedPartNumbers,
+    totalPartsHint = 0,
+  ) => {
     const completedSet = completedPartNumbers instanceof Set
       ? completedPartNumbers
       : new Set(completedPartNumbers || []);
@@ -388,6 +475,13 @@ export function useChunkedUpload() {
 
     const totalChunks = totalPartsHint > 0 ? totalPartsHint : chunks.length;
     let doneCount = completedSet.size;
+
+    totalFileSizeBytesRef.current = Math.max(0, Number(totalFileSizeBytes || 0));
+    uploadedBytesRef.current = chunks.reduce(
+      (acc, chunk) => acc + (completedSet.has(chunk.partNumber) ? chunk.blob.size : 0),
+      0,
+    );
+
     const parts = [];
 
     const statuses = chunks.map((c) => ({
@@ -420,7 +514,7 @@ export function useChunkedUpload() {
 
       setOneStatus(chunk.partNumber, "uploading");
 
-      return uploadChunk(chunk, fileId, fileKey, uploadId, runId)
+      return uploadChunk(chunk, fileId, fileKey, uploadId, bucketName, runId)
         .then((result) => {
           if (runId !== uploadRunIdRef.current) {
             return;
@@ -430,7 +524,9 @@ export function useChunkedUpload() {
           completedSet.add(chunk.partNumber);
           parts.push(result);
           doneCount++;
+          uploadedBytesRef.current += chunk.blob.size;
           setProgress(Math.round((doneCount / Math.max(totalChunks, 1)) * 100));
+          updateEtaEstimate();
 
           return processNext();
         })
@@ -479,16 +575,27 @@ export function useChunkedUpload() {
 
       const chunks = splitFileIntoChunks(file, MIN_S3_CHUNK_MB * MB_BYTES);
       const fileId = buildFileId(file);
+      const normalizedSelectedBucketName = typeof selectedBucketName === "string"
+        ? selectedBucketName.trim()
+        : "";
+      const effectiveSelectedBucketName = normalizedSelectedBucketName || null;
+      console.debug("[upload] selected bucket before start", effectiveSelectedBucketName || "MediVault Bucket");
       const checksumPromise = getOrCreateChecksumPromise(file);
       let uploadId, fileKey;
+      let sessionBucketName = effectiveSelectedBucketName;
       let completedPartNumbers = new Set();
       let totalParts = chunks.length;
 
       const prepared = preparedSessionRef.current;
+      const canUsePreparedSession = prepared
+        && prepared.fileId === fileId
+        && prepared.hasSession
+        && doesSessionMatchSelectedBucket(prepared.bucketName, effectiveSelectedBucketName);
 
-      if (prepared && prepared.fileId === fileId && prepared.hasSession) {
+      if (canUsePreparedSession) {
         uploadId = prepared.uploadId;
         fileKey = prepared.fileKey;
+        sessionBucketName = prepared.bucketName || effectiveSelectedBucketName;
         completedPartNumbers = new Set(prepared.completedPartNumbers || []);
         totalParts = prepared.totalParts > 0 ? prepared.totalParts : chunks.length;
         setProgress(Math.round((completedPartNumbers.size / Math.max(totalParts, 1)) * 100));
@@ -500,16 +607,18 @@ export function useChunkedUpload() {
           file.type,
           file.size,
           startChecksum,
-          selectedBucketName,
+          effectiveSelectedBucketName,
         );
         uploadId = result.upload_id;
         fileKey = result.file_key;
+        sessionBucketName = effectiveSelectedBucketName;
       } else {
-        const savedState = await resumeSession(fileId);
+        const savedState = await resumeSession(fileId, effectiveSelectedBucketName);
 
-        if (savedState) {
+        if (savedState && doesSessionMatchSelectedBucket(savedState.bucket_name, effectiveSelectedBucketName)) {
           uploadId = savedState.upload_id;
           fileKey = savedState.file_key;
+          sessionBucketName = savedState.bucket_name || effectiveSelectedBucketName;
           completedPartNumbers = new Set(savedState.uploaded_part_numbers || []);
           totalParts = savedState.total_parts > 0 ? savedState.total_parts : chunks.length;
           setProgress(Math.round((completedPartNumbers.size / Math.max(totalParts, 1)) * 100));
@@ -521,10 +630,11 @@ export function useChunkedUpload() {
             file.type,
             file.size,
             startChecksum,
-            selectedBucketName,
+            effectiveSelectedBucketName,
           );
           uploadId = result.upload_id;
           fileKey = result.file_key;
+          sessionBucketName = effectiveSelectedBucketName;
         }
       }
 
@@ -532,10 +642,18 @@ export function useChunkedUpload() {
 
       if (currentRunId !== uploadRunIdRef.current) return;
 
-      setUploadInfo({ uploadId, fileKey });
+      setUploadInfo({ uploadId, fileKey, bucketName: sessionBucketName || null });
 
       const { parts, complete } = await uploadWithPool(
-        chunks, fileId, fileKey, uploadId, currentRunId, completedPartNumbers, totalParts
+        chunks,
+        fileId,
+        fileKey,
+        uploadId,
+        sessionBucketName || null,
+        currentRunId,
+        file.size,
+        completedPartNumbers,
+        totalParts,
       );
 
       if (currentRunId !== uploadRunIdRef.current) return;
@@ -543,12 +661,22 @@ export function useChunkedUpload() {
       if (!complete) return; 
 
       const finalChecksum = (await checksumPromise) || PENDING_CHECKSUM;
-      await completeUpload(fileId, fileKey, uploadId, file.name, file.size, parts, finalChecksum);
+      await completeUpload(
+        fileId,
+        fileKey,
+        uploadId,
+        file.name,
+        file.size,
+        parts,
+        finalChecksum,
+        sessionBucketName || null,
+      );
 
       if (currentRunId !== uploadRunIdRef.current) return;
 
       setStatus("completed");
       setProgress(100);
+      setEtaDisplay("0 sec");
       setUploadInfo(null);
       checksumPromisesRef.current.delete(fileId);
       fileValidationPromisesRef.current.delete(fileId);
@@ -563,6 +691,7 @@ export function useChunkedUpload() {
       setDisplayChunkMB(DEFAULT_CHUNK_MB);
       setNetworkType("Medium");
       setAvgUploadSpeedMB(null);
+      setEtaDisplay("Calculating...");
 
       const normalizedError = normalizeUploadError(err);
       setError(normalizedError.message);
@@ -573,7 +702,7 @@ export function useChunkedUpload() {
         activeUploadRef.current = false;
       }
     }
-  }, [ensureFileTypeAllowed, getOrCreateChecksumPromise, resetAdaptiveMetrics, abortActiveChunkRequests]);
+  }, [ensureFileTypeAllowed, getOrCreateChecksumPromise, resetAdaptiveMetrics, abortActiveChunkRequests, updateEtaEstimate]);
 
   const pause = useCallback(() => {
     isPausedRef.current = true;
@@ -595,7 +724,7 @@ export function useChunkedUpload() {
       fileValidationPromisesRef.current.delete(buildFileId(fileRef.current));
     }
     if (uploadInfo) {
-      try { await abortUpload(uploadInfo.fileKey, uploadInfo.uploadId); } catch { }
+      try { await abortUpload(uploadInfo.fileKey, uploadInfo.uploadId, uploadInfo.bucketName || null); } catch { }
     }
     fileRef.current = null;
     setStatus("idle");
@@ -617,6 +746,7 @@ export function useChunkedUpload() {
     networkType,
     displayChunkMB,
     avgUploadSpeedMB,
+    etaDisplay,
     prepareUpload,
     upload,
     pause,

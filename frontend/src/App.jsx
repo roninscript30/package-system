@@ -7,12 +7,13 @@ import FilePreviewModal from "./components/FilePreviewModal";
 import ToastStack from "./components/ToastStack";
 import Login from "./components/Login";
 import { getCurrentUser } from "./api/authApi";
-import { addBucket, deleteBucket, getBucketUsage, getBuckets, getUploadHistory } from "./api/uploadApi";
+import { addBucket, deleteBucket, getBucketUsage, getBuckets, getUploadHistory, updateBucket } from "./api/uploadApi";
 import JSZip from "jszip";
 import "./App.css";
 
 const TOAST_TTL_MS = 7000;
 const COMPLETION_REFRESH_MS = 5000;
+const BYTES_PER_GB = 1024 * 1024 * 1024;
 const BUCKET_NAME_REGEX = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
 const REGION_FORMAT_REGEX = /^[a-z]{2}-[a-z]+-\d+$/;
 
@@ -59,6 +60,56 @@ function validateBucketPayload(payload) {
     }
   }
 
+  const useKms = Boolean(payload.use_kms);
+  const kmsKeyId = `${payload.kms_key_id || ""}`.trim();
+  if (useKms && !kmsKeyId) {
+    errors.kms_key_id = "KMS Key ID / ARN is required when KMS encryption is enabled.";
+  }
+
+  const notes = `${payload.notes || ""}`;
+  if (notes.length > 2000) {
+    errors.notes = "Notes must be 2000 characters or fewer.";
+  }
+
+  return errors;
+}
+
+function validateBucketMetadataPayload(payload) {
+  const errors = {};
+
+  const displayName = `${payload.display_name || ""}`.trim();
+  if (!displayName) {
+    errors.display_name = "Display name is required.";
+  }
+
+  const region = `${payload.region || ""}`.trim();
+  if (!region) {
+    errors.region = "Region is required.";
+  } else if (!REGION_FORMAT_REGEX.test(region)) {
+    errors.region = "Region must look like ap-south-1.";
+  }
+
+  const sizeLimitGbRaw = `${payload.size_limit_gb ?? ""}`.trim();
+  if (!sizeLimitGbRaw) {
+    errors.size_limit_gb = "Size limit is required.";
+  } else {
+    const sizeLimitGb = Number(sizeLimitGbRaw);
+    if (!Number.isFinite(sizeLimitGb) || sizeLimitGb <= 0) {
+      errors.size_limit_gb = "Size limit must be greater than 0.";
+    }
+  }
+
+  const notes = `${payload.notes || ""}`;
+  if (notes.length > 2000) {
+    errors.notes = "Notes must be 2000 characters or fewer.";
+  }
+
+  const useKms = Boolean(payload.use_kms);
+  const kmsKeyId = `${payload.kms_key_id || ""}`.trim();
+  if (useKms && !kmsKeyId) {
+    errors.kms_key_id = "KMS Key ID / ARN is required when KMS encryption is enabled.";
+  }
+
   return errors;
 }
 
@@ -96,6 +147,7 @@ function App() {
   const [dataError, setDataError] = useState(null);
   const [bucketSaving, setBucketSaving] = useState(false);
   const [bucketDeletingId, setBucketDeletingId] = useState(null);
+  const [bucketUpdating, setBucketUpdating] = useState(false);
   const [selectedUploadBucket, setSelectedUploadBucket] = useState("");
   const [uploadGrowthFilter, setUploadGrowthFilter] = useState("all");
   const [graphFromDate, setGraphFromDate] = useState("");
@@ -110,9 +162,26 @@ function App() {
     aws_access_key_id: "",
     aws_secret_access_key: "",
     size_limit_gb: "10",
+    use_kms: false,
+    kms_key_id: "",
+    notes: "",
   });
   const [bucketFormErrors, setBucketFormErrors] = useState({});
   const [bucketFormTouched, setBucketFormTouched] = useState({});
+  const [bucketAdvancedOpen, setBucketAdvancedOpen] = useState(false);
+  const [bucketEditForm, setBucketEditForm] = useState({
+    bucket_id: "",
+    bucket_name: "",
+    display_name: "",
+    region: "",
+    size_limit_gb: "10",
+    use_kms: false,
+    kms_key_id: "",
+    notes: "",
+  });
+  const [bucketEditErrors, setBucketEditErrors] = useState({});
+  const [bucketEditTouched, setBucketEditTouched] = useState({});
+  const [bucketEditAdvancedOpen, setBucketEditAdvancedOpen] = useState(false);
   const completionRefreshTimerRef = useRef(null);
   const completionNoticeShownRef = useRef(false);
   const userMenuRef = useRef(null);
@@ -123,9 +192,11 @@ function App() {
     chunkStatuses,
     error,
     errorMeta,
+    uploadInfo,
     networkType,
     displayChunkMB,
     avgUploadSpeedMB,
+    etaDisplay,
     prepareUpload,
     upload,
     pause,
@@ -217,7 +288,8 @@ function App() {
     if (!selectedFile) return;
 
     try {
-      await prepareUpload(selectedFile);
+      const normalizedBucket = selectedUploadBucket.trim();
+      await prepareUpload(selectedFile, normalizedBucket || null);
     } catch (err) {
       if (err?.code === "FILE_TYPE_NOT_ALLOWED") {
         setFile(null);
@@ -235,7 +307,7 @@ function App() {
         "Could not verify previous upload session. Please try selecting the file again."
       );
     }
-  }, [cancel, prepareUpload, pushToast]);
+  }, [cancel, prepareUpload, pushToast, selectedUploadBucket]);
 
   const handleFolderSelect = useCallback(async (selectedFiles) => {
     if (!selectedFiles || selectedFiles.length === 0) return;
@@ -274,7 +346,8 @@ function App() {
       });
 
       setFile(zipFile);
-      await prepareUpload(zipFile);
+      const normalizedBucket = selectedUploadBucket.trim();
+      await prepareUpload(zipFile, normalizedBucket || null);
 
       pushToast(
         "success",
@@ -291,11 +364,12 @@ function App() {
     } finally {
       setIsPreparingFolder(false);
     }
-  }, [cancel, prepareUpload, pushToast]);
+  }, [cancel, prepareUpload, pushToast, selectedUploadBucket]);
 
   const handleUpload = useCallback(() => {
     if (file) {
       const normalizedBucket = selectedUploadBucket.trim();
+      console.debug("[upload-ui] Start Upload clicked with bucket", normalizedBucket || "MediVault Bucket");
       upload(file, normalizedBucket || null);
     }
   }, [file, selectedUploadBucket, upload]);
@@ -305,6 +379,8 @@ function App() {
     setFile(null);
     setShowPreview(false);
   }, [cancel]);
+
+  const activeUploadBucketLabel = uploadInfo?.bucketName || selectedUploadBucket || "MediVault Bucket";
 
   useEffect(() => {
     if (!errorMeta) return;
@@ -588,7 +664,27 @@ function App() {
     const yesterdayUploadCount = dailyUploadCounts.get(yesterdayKey) || 0;
     const xAxisLabelStep = Math.max(1, Math.ceil(Math.max(filteredDateKeys.length, 1) / 8));
 
-    const bucketDistribution = Array.from(bucketStatsMap.values())
+    const liveBucketDistribution = buckets
+      .map((bucket) => {
+        const usage = bucketUsageByName[bucket.bucket_name];
+        if (!usage) return null;
+
+        return {
+          bucket: bucket.bucket_name,
+          used: Math.max(0, Number(usage.used || 0)),
+          limit: Math.max(0, Number(usage.limit || 0)),
+          percent: Math.max(0, Number(usage.percent || 0)),
+          status: usage.status || "ok",
+          message: usage.message || "Bucket storage usage is within limit",
+          bytes: Math.max(0, Number(usage.used || 0)),
+        };
+      })
+      .filter(Boolean);
+
+    const bucketDistribution = (liveBucketDistribution.length > 0
+      ? liveBucketDistribution
+      : Array.from(bucketStatsMap.values())
+    )
       .sort((a, b) => b.bytes - a.bytes)
       .slice(0, 6);
     const maxBucketBytes = bucketDistribution.reduce((max, item) => Math.max(max, item.bytes), 0);
@@ -604,7 +700,7 @@ function App() {
       bucketDistribution,
       maxBucketBytes,
     };
-  }, [history, uploadGrowthFilter, graphFromDate, graphToDate]);
+  }, [history, uploadGrowthFilter, graphFromDate, graphToDate, buckets, bucketUsageByName]);
 
   const filteredHistoryRecords = useMemo(() => {
     const normalizedSearch = historySearchQuery.trim().toLowerCase();
@@ -672,6 +768,9 @@ function App() {
       aws_access_key_id: bucketForm.aws_access_key_id.trim(),
       aws_secret_access_key: bucketForm.aws_secret_access_key.trim(),
       size_limit_gb: bucketForm.size_limit_gb,
+      use_kms: Boolean(bucketForm.use_kms),
+      kms_key_id: `${bucketForm.kms_key_id || ""}`.trim(),
+      notes: bucketForm.notes,
     };
 
     if (!payload.bucket_name || !payload.region || !payload.aws_access_key_id || !payload.aws_secret_access_key || !payload.size_limit_gb) {
@@ -683,6 +782,8 @@ function App() {
         aws_access_key_id: true,
         aws_secret_access_key: true,
         size_limit_gb: true,
+        kms_key_id: true,
+        notes: true,
       });
       pushToast("warning", "Validation Required", "Please fix bucket form errors before saving.");
       return;
@@ -697,6 +798,8 @@ function App() {
         aws_access_key_id: true,
         aws_secret_access_key: true,
         size_limit_gb: true,
+        kms_key_id: true,
+        notes: true,
       });
       pushToast("warning", "Validation Required", "Please fix bucket form errors before saving.");
       return;
@@ -712,6 +815,9 @@ function App() {
         aws_access_key_id: payload.aws_access_key_id,
         aws_secret_access_key: payload.aws_secret_access_key,
         size_limit: sizeLimitBytes,
+        use_kms: payload.use_kms,
+        kms_key_id: payload.kms_key_id || undefined,
+        notes: payload.notes?.trim() || "",
       });
       pushToast("success", "Bucket Saved", result?.message || "Bucket credentials were saved.");
       setBucketForm((prev) => ({
@@ -720,9 +826,13 @@ function App() {
         aws_access_key_id: "",
         aws_secret_access_key: "",
         size_limit_gb: "10",
+        use_kms: false,
+        kms_key_id: "",
+        notes: "",
       }));
       setBucketFormErrors({});
       setBucketFormTouched({});
+      setBucketAdvancedOpen(false);
       await fetchWorkspaceData();
 
       if (!selectedUploadBucket) {
@@ -759,6 +869,111 @@ function App() {
       setBucketDeletingId(null);
     }
   }, [bucketDeletingId, fetchWorkspaceData, pushToast, selectedUploadBucket]);
+
+  const handleOpenEditBucket = useCallback((bucket) => {
+    if (!bucket?.id || bucket.system_default) return;
+
+    const sizeLimitGb = Number(bucket.size_limit || 0) > 0
+      ? (Number(bucket.size_limit) / BYTES_PER_GB).toFixed(2)
+      : "10";
+
+    setBucketEditForm({
+      bucket_id: bucket.id,
+      bucket_name: bucket.bucket_name || "",
+      display_name: bucket.display_name || bucket.bucket_name || "",
+      region: bucket.region || "",
+      size_limit_gb: sizeLimitGb,
+      use_kms: Boolean(bucket.use_kms),
+      kms_key_id: bucket.kms_key_id || "",
+      notes: bucket.notes || "",
+    });
+    setBucketEditErrors({});
+    setBucketEditTouched({});
+    setBucketEditAdvancedOpen(false);
+  }, []);
+
+  const handleCloseEditBucket = useCallback(() => {
+    if (bucketUpdating) return;
+    setBucketEditForm({
+      bucket_id: "",
+      bucket_name: "",
+      display_name: "",
+      region: "",
+      size_limit_gb: "10",
+      use_kms: false,
+      kms_key_id: "",
+      notes: "",
+    });
+    setBucketEditErrors({});
+    setBucketEditTouched({});
+    setBucketEditAdvancedOpen(false);
+  }, [bucketUpdating]);
+
+  const handleBucketEditFieldChange = useCallback((field, value) => {
+    setBucketEditForm((prev) => {
+      const next = { ...prev, [field]: value };
+      if (bucketEditTouched[field]) {
+        const errors = validateBucketMetadataPayload(next);
+        setBucketEditErrors((prevErrors) => ({ ...prevErrors, [field]: errors[field] }));
+      }
+      return next;
+    });
+  }, [bucketEditTouched]);
+
+  const handleBucketEditFieldBlur = useCallback((field) => {
+    setBucketEditTouched((prev) => ({ ...prev, [field]: true }));
+    const errors = validateBucketMetadataPayload(bucketEditForm);
+    setBucketEditErrors((prevErrors) => ({ ...prevErrors, [field]: errors[field] }));
+  }, [bucketEditForm]);
+
+  const handleSaveBucketEdit = useCallback(async (event) => {
+    event.preventDefault();
+    if (bucketUpdating || !bucketEditForm.bucket_id) return;
+
+    const payload = {
+      display_name: bucketEditForm.display_name.trim(),
+      region: bucketEditForm.region.trim(),
+      size_limit_gb: bucketEditForm.size_limit_gb,
+      use_kms: Boolean(bucketEditForm.use_kms),
+      kms_key_id: `${bucketEditForm.kms_key_id || ""}`.trim(),
+      notes: bucketEditForm.notes,
+    };
+
+    const validationErrors = validateBucketMetadataPayload(payload);
+    if (Object.keys(validationErrors).length > 0) {
+      setBucketEditErrors(validationErrors);
+      setBucketEditTouched({
+        display_name: true,
+        region: true,
+        size_limit_gb: true,
+        kms_key_id: true,
+        notes: true,
+      });
+      pushToast("warning", "Validation Required", "Please fix edit form errors before saving.");
+      return;
+    }
+
+    const sizeLimitBytes = Math.round(Number(payload.size_limit_gb) * BYTES_PER_GB);
+
+    setBucketUpdating(true);
+    try {
+      await updateBucket(bucketEditForm.bucket_id, {
+        display_name: payload.display_name,
+        region: payload.region,
+        size_limit: sizeLimitBytes,
+        use_kms: payload.use_kms,
+        kms_key_id: payload.kms_key_id || null,
+        notes: payload.notes?.trim() || "",
+      });
+      pushToast("success", "Bucket Updated", "Bucket updated successfully");
+      handleCloseEditBucket();
+      await fetchWorkspaceData();
+    } catch (err) {
+      pushToast("error", "Update Failed", getDetailMessage(err, "Could not update bucket."));
+    } finally {
+      setBucketUpdating(false);
+    }
+  }, [bucketEditForm, bucketUpdating, fetchWorkspaceData, handleCloseEditBucket, pushToast]);
 
   const renderDataError = dataError ? (
     <div className="rounded-lg border border-error/20 bg-error-container px-4 py-3 text-xs font-semibold text-error">
@@ -918,9 +1133,25 @@ function App() {
                     return { ...point, x, y };
                   });
 
+                  const trendPath = points
+                    .map((point, index) => `${index === 0 ? "M" : "L"}${point.x} ${point.y}`)
+                    .join(" ");
+
                   return (
                     <svg className="w-full h-[200px]" viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label="Upload size by date chart">
                       <line x1={leftPadding} y1={chartHeight - bottomPadding} x2={chartWidth - rightPadding} y2={chartHeight - bottomPadding} stroke="rgba(116,119,126,0.45)" strokeWidth="1" />
+
+                      {points.length > 1 ? (
+                        <path
+                          d={trendPath}
+                          fill="none"
+                          stroke="#0f766e"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          opacity="0.75"
+                        />
+                      ) : null}
 
                       {points.map((point) => (
                         <g key={point.key}>
@@ -967,19 +1198,46 @@ function App() {
             ) : (
               <div className="mt-4 space-y-3">
                 {dashboardInsights.bucketDistribution.map((item) => {
-                  const widthPercent = dashboardInsights.maxBucketBytes > 0
-                    ? Math.max(8, Math.round((item.bytes / dashboardInsights.maxBucketBytes) * 100))
-                    : 8;
+                  const hasPercent = Number.isFinite(item.percent);
+                  const widthPercent = hasPercent
+                    ? Math.max(4, Math.min(100, item.percent))
+                    : dashboardInsights.maxBucketBytes > 0
+                      ? Math.max(8, Math.round((item.bytes / dashboardInsights.maxBucketBytes) * 100))
+                      : 8;
+
+                  const usageText = Number.isFinite(item.limit) && item.limit > 0
+                    ? `${formatBytes(item.used || item.bytes)} / ${formatBytes(item.limit)}`
+                    : `${formatBytes(item.bytes)} / -`;
+
+                  const percentText = hasPercent ? `${item.percent.toFixed(1)}%` : "-";
+
+                  const barClass = item.status === "exceeded"
+                    ? "bg-error"
+                    : item.status === "warning"
+                      ? "bg-warning"
+                      : "bg-teal-600";
+
+                  const messageClass = item.status === "exceeded"
+                    ? "text-error"
+                    : item.status === "warning"
+                      ? "text-warning"
+                      : "text-on-surface-variant";
 
                   return (
                     <div key={item.bucket}>
                       <div className="flex items-center justify-between text-[10px] font-bold text-on-surface-variant mb-1">
                         <span className="truncate max-w-[160px]" title={item.bucket}>{item.bucket}</span>
-                        <span>{formatBytes(item.bytes)}</span>
+                        <span>{usageText}</span>
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] font-bold text-on-surface-variant mb-1">
+                        <span>{percentText}</span>
                       </div>
                       <div className="h-2 rounded bg-surface-container-low overflow-hidden">
-                        <div className="h-full rounded bg-teal-600" style={{ width: `${widthPercent}%` }}></div>
+                        <div className={`h-full rounded ${barClass}`} style={{ width: `${widthPercent}%` }}></div>
                       </div>
+                      {item.message ? (
+                        <p className={`mt-1 text-[10px] font-semibold ${messageClass}`}>{item.message}</p>
+                      ) : null}
                     </div>
                   );
                 })}
@@ -1079,7 +1337,14 @@ function App() {
             isPreparingFolder={isPreparingFolder}
           />
 
-          <UploadStatus status={status} error={error} networkType={networkType} displayChunkMB={displayChunkMB} />
+          <UploadStatus
+            status={status}
+            error={error}
+            networkType={networkType}
+            displayChunkMB={displayChunkMB}
+            etaDisplay={etaDisplay}
+            targetBucketName={activeUploadBucketLabel}
+          />
 
           {(status === "uploading" || status === "paused" || status === "completed") && (
             <ProgressTracker
@@ -1091,30 +1356,6 @@ function App() {
         </section>
 
         <aside className="xl:col-span-4 space-y-4">
-          <div className="bg-surface-container-lowest rounded-xl p-6 border border-surface-container-high shadow-sm">
-            <h3 className="text-sm font-bold text-primary headline">Network Status</h3>
-            {status === "uploading" ? (
-              <div className="mt-4 space-y-2 text-xs font-semibold text-on-surface-variant">
-                <div className="flex justify-between">
-                  <span>Speed</span>
-                  <span>{Number.isFinite(avgUploadSpeedMB) ? `${avgUploadSpeedMB.toFixed(2)} MB/s` : "Calculating..."}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Status</span>
-                  <span>
-                    {networkType === "Slow" ? "Slow 🐢" : networkType === "Medium" ? "Medium ⚡" : "Fast 🚀"}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Adaptive Mode</span>
-                  <span>ON</span>
-                </div>
-              </div>
-            ) : (
-              <p className="mt-4 text-xs font-semibold text-on-surface-variant">Idle</p>
-            )}
-          </div>
-
           <div className="bg-surface-container-lowest rounded-xl p-6 border border-surface-container-high shadow-sm">
             <h3 className="text-sm font-bold text-primary headline">Live Vault Metrics</h3>
             <div className="mt-4 space-y-3 text-xs font-semibold text-on-surface-variant">
@@ -1144,6 +1385,30 @@ function App() {
               </div>
             ) : (
               <p className="mt-4 text-xs text-on-surface-variant font-semibold">No upload history available yet.</p>
+            )}
+          </div>
+
+          <div className="bg-surface-container-lowest rounded-xl p-6 border border-surface-container-high shadow-sm">
+            <h3 className="text-sm font-bold text-primary headline">Network Status</h3>
+            {status === "uploading" ? (
+              <div className="mt-4 space-y-2 text-xs font-semibold text-on-surface-variant">
+                <div className="flex justify-between">
+                  <span>Speed</span>
+                  <span>{Number.isFinite(avgUploadSpeedMB) ? `${avgUploadSpeedMB.toFixed(2)} MB/s` : "Calculating..."}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Status</span>
+                  <span>
+                    {networkType === "Slow" ? "Slow 🐢" : networkType === "Medium" ? "Medium ⚡" : "Fast 🚀"}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Adaptive Mode</span>
+                  <span>ON</span>
+                </div>
+              </div>
+            ) : (
+              <p className="mt-4 text-xs font-semibold text-on-surface-variant">Idle</p>
             )}
           </div>
         </aside>
@@ -1247,6 +1512,58 @@ function App() {
               ) : null}
             </div>
 
+            <div className="border border-surface-container-high rounded-lg overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setBucketAdvancedOpen((prev) => !prev)}
+                className="w-full flex items-center justify-between px-3 py-2.5 text-xs font-bold uppercase tracking-widest text-on-surface-variant bg-surface-container-low"
+              >
+                <span>Advanced Options</span>
+                <span>{bucketAdvancedOpen ? "Hide" : "Show"}</span>
+              </button>
+              {bucketAdvancedOpen ? (
+                <div className="p-3 space-y-3 bg-surface-container-lowest">
+                  <label className="flex items-center justify-between gap-3 text-xs font-semibold text-on-surface">
+                    <span>Enable KMS Encryption</span>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(bucketForm.use_kms)}
+                      onChange={(event) => handleBucketFieldChange("use_kms", event.target.checked)}
+                    />
+                  </label>
+
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">KMS Key ID / ARN</label>
+                    <input
+                      className={`w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm ${bucketFormTouched.kms_key_id && bucketFormErrors.kms_key_id ? "border border-error" : "border border-transparent"}`}
+                      value={bucketForm.kms_key_id}
+                      onChange={(event) => handleBucketFieldChange("kms_key_id", event.target.value)}
+                      onBlur={() => handleBucketFieldBlur("kms_key_id")}
+                      placeholder="arn:aws:kms:region:account:key/..."
+                    />
+                    {bucketFormTouched.kms_key_id && bucketFormErrors.kms_key_id ? (
+                      <p className="mt-1 text-[11px] text-error font-semibold">{bucketFormErrors.kms_key_id}</p>
+                    ) : null}
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">Notes (optional)</label>
+                    <textarea
+                      rows={3}
+                      className={`w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm ${bucketFormTouched.notes && bucketFormErrors.notes ? "border border-error" : "border border-transparent"}`}
+                      value={bucketForm.notes}
+                      onChange={(event) => handleBucketFieldChange("notes", event.target.value)}
+                      onBlur={() => handleBucketFieldBlur("notes")}
+                      placeholder="Internal notes about this bucket"
+                    />
+                    {bucketFormTouched.notes && bucketFormErrors.notes ? (
+                      <p className="mt-1 text-[11px] text-error font-semibold">{bucketFormErrors.notes}</p>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
             <button
               type="submit"
               disabled={bucketSaving}
@@ -1283,7 +1600,8 @@ function App() {
                   buckets.map((bucket) => (
                     <tr key={bucket.id} className="hover:bg-surface-container-low/30 transition-colors">
                       <td className="px-6 py-5 text-sm font-semibold text-primary">
-                        {bucket.bucket_name}
+                        <div>{bucket.display_name || bucket.bucket_name}</div>
+                        <p className="mt-0.5 text-[11px] font-medium text-on-surface-variant">{bucket.bucket_name}</p>
                         {(() => {
                           const usage = bucketUsageByName[bucket.bucket_name];
                           const usedBytes = Number(usage?.used || 0);
@@ -1329,14 +1647,24 @@ function App() {
                         )}
                       </td>
                       <td className="px-6 py-5 text-right">
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteBucket(bucket)}
-                          disabled={bucket.system_default || bucketDeletingId === bucket.id}
-                          className="rounded-lg bg-error-container text-error px-3 py-1.5 text-xs font-bold disabled:opacity-60"
-                        >
-                          {bucket.system_default ? "Locked" : bucketDeletingId === bucket.id ? "Deleting..." : "Delete"}
-                        </button>
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleOpenEditBucket(bucket)}
+                            disabled={bucket.system_default || bucketUpdating}
+                            className="rounded-lg bg-surface-container-high text-primary px-3 py-1.5 text-xs font-bold disabled:opacity-60"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteBucket(bucket)}
+                            disabled={bucket.system_default || bucketDeletingId === bucket.id}
+                            className="rounded-lg bg-error-container text-error px-3 py-1.5 text-xs font-bold disabled:opacity-60"
+                          >
+                            {bucket.system_default ? "Locked" : bucketDeletingId === bucket.id ? "Deleting..." : "Delete"}
+                          </button>
+                        </div>
                       </td>
                       <td className="px-6 py-5 text-xs text-on-surface-variant text-right font-medium">{formatDate(bucket.created_at)}</td>
                     </tr>
@@ -1347,6 +1675,154 @@ function App() {
           </div>
         </section>
       </div>
+
+      {bucketEditForm.bucket_id ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/35 px-4">
+          <div className="w-full max-w-lg rounded-xl bg-surface-container-lowest border border-surface-container-high shadow-xl p-6">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-bold text-primary headline">Edit Bucket</h3>
+                <p className="mt-1 text-xs font-medium text-on-surface-variant">Update saved bucket metadata.</p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseEditBucket}
+                disabled={bucketUpdating}
+                className="rounded-lg bg-surface-container-high px-2.5 py-1 text-xs font-bold text-primary disabled:opacity-60"
+              >
+                Close
+              </button>
+            </div>
+
+            <form className="mt-4 space-y-4" onSubmit={handleSaveBucketEdit}>
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">Bucket Name</label>
+                <input
+                  readOnly
+                  className="w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm border border-surface-container-high text-on-surface-variant"
+                  value={bucketEditForm.bucket_name}
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">Display Name</label>
+                <input
+                  className={`w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm ${bucketEditTouched.display_name && bucketEditErrors.display_name ? "border border-error" : "border border-transparent"}`}
+                  value={bucketEditForm.display_name}
+                  onChange={(event) => handleBucketEditFieldChange("display_name", event.target.value)}
+                  onBlur={() => handleBucketEditFieldBlur("display_name")}
+                  placeholder="My Team Bucket"
+                />
+                {bucketEditTouched.display_name && bucketEditErrors.display_name ? (
+                  <p className="mt-1 text-[11px] text-error font-semibold">{bucketEditErrors.display_name}</p>
+                ) : null}
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">Region</label>
+                <input
+                  className={`w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm ${bucketEditTouched.region && bucketEditErrors.region ? "border border-error" : "border border-transparent"}`}
+                  value={bucketEditForm.region}
+                  onChange={(event) => handleBucketEditFieldChange("region", event.target.value)}
+                  onBlur={() => handleBucketEditFieldBlur("region")}
+                  placeholder="ap-south-1"
+                  list="aws-region-suggestions"
+                />
+                {bucketEditTouched.region && bucketEditErrors.region ? (
+                  <p className="mt-1 text-[11px] text-error font-semibold">{bucketEditErrors.region}</p>
+                ) : null}
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">Size Limit (GB)</label>
+                <input
+                  type="number"
+                  min="1"
+                  step="0.01"
+                  className={`w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm ${bucketEditTouched.size_limit_gb && bucketEditErrors.size_limit_gb ? "border border-error" : "border border-transparent"}`}
+                  value={bucketEditForm.size_limit_gb}
+                  onChange={(event) => handleBucketEditFieldChange("size_limit_gb", event.target.value)}
+                  onBlur={() => handleBucketEditFieldBlur("size_limit_gb")}
+                  placeholder="10"
+                />
+                {bucketEditTouched.size_limit_gb && bucketEditErrors.size_limit_gb ? (
+                  <p className="mt-1 text-[11px] text-error font-semibold">{bucketEditErrors.size_limit_gb}</p>
+                ) : null}
+              </div>
+
+              <div className="border border-surface-container-high rounded-lg overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setBucketEditAdvancedOpen((prev) => !prev)}
+                  className="w-full flex items-center justify-between px-3 py-2.5 text-xs font-bold uppercase tracking-widest text-on-surface-variant bg-surface-container-low"
+                >
+                  <span>Advanced Options</span>
+                  <span>{bucketEditAdvancedOpen ? "Hide" : "Show"}</span>
+                </button>
+                {bucketEditAdvancedOpen ? (
+                  <div className="p-3 space-y-3 bg-surface-container-lowest">
+                    <label className="flex items-center justify-between gap-3 text-xs font-semibold text-on-surface">
+                      <span>Enable KMS Encryption</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(bucketEditForm.use_kms)}
+                        onChange={(event) => handleBucketEditFieldChange("use_kms", event.target.checked)}
+                      />
+                    </label>
+
+                    <div>
+                      <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">KMS Key ID / ARN</label>
+                      <input
+                        className={`w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm ${bucketEditTouched.kms_key_id && bucketEditErrors.kms_key_id ? "border border-error" : "border border-transparent"}`}
+                        value={bucketEditForm.kms_key_id}
+                        onChange={(event) => handleBucketEditFieldChange("kms_key_id", event.target.value)}
+                        onBlur={() => handleBucketEditFieldBlur("kms_key_id")}
+                        placeholder="arn:aws:kms:region:account:key/..."
+                      />
+                      {bucketEditTouched.kms_key_id && bucketEditErrors.kms_key_id ? (
+                        <p className="mt-1 text-[11px] text-error font-semibold">{bucketEditErrors.kms_key_id}</p>
+                      ) : null}
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-1">Notes (optional)</label>
+                      <textarea
+                        rows={3}
+                        className={`w-full rounded-lg bg-surface-container-highest px-3 py-2.5 text-sm ${bucketEditTouched.notes && bucketEditErrors.notes ? "border border-error" : "border border-transparent"}`}
+                        value={bucketEditForm.notes}
+                        onChange={(event) => handleBucketEditFieldChange("notes", event.target.value)}
+                        onBlur={() => handleBucketEditFieldBlur("notes")}
+                        placeholder="Internal notes about this bucket"
+                      />
+                      {bucketEditTouched.notes && bucketEditErrors.notes ? (
+                        <p className="mt-1 text-[11px] text-error font-semibold">{bucketEditErrors.notes}</p>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleCloseEditBucket}
+                  disabled={bucketUpdating}
+                  className="rounded-lg bg-surface-container-high text-primary px-4 py-2 text-xs font-bold disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={bucketUpdating}
+                  className="rounded-lg bg-primary text-on-primary px-4 py-2 text-xs font-bold disabled:opacity-60"
+                >
+                  {bucketUpdating ? "Saving..." : "Save Changes"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 
